@@ -1,0 +1,63 @@
+---
+title: "Survival analysis for breast cancer"
+author: "Valentin CAPIEU"
+date: "2025-10-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+```{r}
+library(readr)
+
+#import TSV file into data frame
+df <- read_tsv("data/brca_metabric_clinical_data.tsv")
+head(df)
+```
+the columns Sample ID and Patient ID seems to be the same, the column cancer type seems to take only one value, same for the column Study ID, Sample Type, Number of Samples Per Patient. If these assumption are true, I will delete Sample ID, cancer type, study ID.
+
+```{r check_and_clean, message=FALSE, warning=FALSE, echo=FALSE}
+# Check if Sample ID and Patient ID are identical
+identical_ids <- identical(df$`Sample ID`, df$`Patient ID`)
+cat("Are 'Sample ID' and 'Patient ID' identical? →", identical_ids, "\n")
+
+# Check unique values in cancer type, Study ID, Sample Type, Number of Samples Per Patient
+unique_cancer_types <- unique(df$`Cancer Type`)
+unique_study_ids <- unique(df$`Study ID`)
+unique_sample_types <- unique(df$`Sample Type`)
+unique_numbers_of_samples_per_patient<-unique(df$`Number of Samples Per Patient`)
+
+#cat("Unique values in 'Cancer Type':", length(unique_cancer_types), "\n")
+#cat("Unique values in 'Study ID':", length(unique_study_ids), "\n")
+cat("Unique values in 'Study ID','Cancer Type','Sample Type','Number of Samples Per Patient' : ", length(unique_cancer_types), length(unique_study_ids), length(unique_sample_types), length(unique_numbers_of_samples_per_patient), "\n")
+
+# If assumptions are true, remove redundant columns
+if (identical_ids) {
+  df <- subset(df, select = -`Sample ID`)
+}
+
+if (length(unique_cancer_types) == 1) {
+  df <- subset(df, select = -`Cancer Type`)
+}
+
+if (length(unique_study_ids) == 1) {
+  df <- subset(df, select = -`Study ID`)
+}
+
+if (length(unique_sample_types) == 1) {
+  df <- subset(df, select = -`Sample Type`)
+}
+
+if (length(unique_numbers_of_samples_per_patient) == 1) {
+  df <- subset(df, select = -`Number of Samples Per Patient`)
+}
+
+# Confirm structure after cleaning
+cat("\nColumns remaining after cleaning:\n")
+print(names(df))
+```
+
