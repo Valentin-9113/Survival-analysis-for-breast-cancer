@@ -1,0 +1,103 @@
+---
+title: "Survival Analysis Project"
+author: "Valentin CAPIEU"
+date: "2025-11-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(data.table)
+
+```
+```{r}
+# Load dataset
+data <- fread("data/brca_metabric_clinical_data.tsv")
+```
+
+```{r}
+# Check if Sample ID and Patient ID are identical
+identical_ids <- identical(data$`Sample ID`, data$`Patient ID`)
+cat("Are 'Sample ID' and 'Patient ID' identical? →", identical_ids, "\n")
+
+# Check unique values in cancer type, Study ID, Sample Type, Number of Samples Per Patient
+unique_cancer_types <- unique(data$`Cancer Type`)
+unique_study_ids <- unique(data$`Study ID`)
+unique_sample_types <- unique(data$`Sample Type`)
+unique_numbers_of_samples_per_patient<-unique(data$`Number of Samples Per Patient`)
+
+#cat("Unique values in 'Cancer Type':", length(unique_cancer_types), "\n")
+#cat("Unique values in 'Study ID':", length(unique_study_ids), "\n")
+cat("Unique values in 'Study ID','Cancer Type','Sample Type','Number of Samples Per Patient' : ", length(unique_cancer_types), length(unique_study_ids), length(unique_sample_types), length(unique_numbers_of_samples_per_patient), "\n")
+
+# If assumptions are true, remove redundant columns
+if (identical_ids) {
+  data <- subset(data, select = -`Sample ID`)
+}
+
+if (length(unique_cancer_types) == 1) {
+  data <- subset(data, select = -`Cancer Type`)
+}
+
+if (length(unique_study_ids) == 1) {
+  data <- subset(data, select = -`Study ID`)
+}
+
+if (length(unique_sample_types) == 1) {
+  data <- subset(data, select = -`Sample Type`)
+}
+
+if (length(unique_numbers_of_samples_per_patient) == 1) {
+  data <- subset(data, select = -`Number of Samples Per Patient`)
+}
+
+# Confirm structure after cleaning
+cat("\nColumns remaining after cleaning:\n")
+print(names(data))
+```
+```
+
+
+```{r}
+str(data)
+
+# Separate continuous and categorical covariates
+continuous_vars <- names(data)[sapply(data, is.numeric)]
+categorical_vars <- names(data)[sapply(data, function(x) is.character(x) | is.factor(x))]
+
+```
+
+```{r}
+# Create a folder for plots
+dir.create("plots", showWarnings = FALSE)
+
+for (v in continuous_vars) {
+  p <- ggplot(data, aes_string(x = v)) +
+    geom_histogram(bins = 30, color = "black", fill = "skyblue") +
+    theme_minimal() +
+    labs(title = paste("Histogram of", v))
+  
+  # ggsave(filename = paste0("plots/hist_", v, ".png"), plot = p, width = 6, height = 4
+  p
+}
+
+```
+
+```{r}
+for (v in categorical_vars) {
+  p <- ggplot(data, aes_string(x = v)) +
+    geom_bar(fill = "orange") +
+    theme_minimal() +
+    labs(title = paste("Bar plot of", v), x = v, y = "Count") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  ggsave(filename = paste0("plots/bar_", v, ".png"), plot = p, width = 6, height = 4)
+}
+
+```
+

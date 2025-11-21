@@ -16,7 +16,6 @@ library(readr)
 
 #import TSV file into data frame
 df <- read_tsv("data/brca_metabric_clinical_data.tsv")
-head(df)
 ```
 the columns Sample ID and Patient ID seems to be the same, the column cancer type seems to take only one value, same for the column Study ID, Sample Type, Number of Samples Per Patient. If these assumption are true, I will delete Sample ID, cancer type, study ID.
 
