@@ -1,0 +1,452 @@
+---
+title: "clv2"
+author: "Valentin CAPIEU"
+date: "2025-11-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(corrplot)
+library(GGally)
+library(gridExtra)
+library(reshape2)
+library(data.table)
+#install.packages("survival")
+library(survival)
+#install.packages("survminer")
+library(survminer)
+library(caret)
+```
+
+### pre processing
+
+```{r}
+# Load dataset
+data <- fread("data/brca_metabric_clinical_data.tsv")
+```
+
+```{r}
+# Check if Sample ID and Patient ID are identical
+identical_ids <- identical(data$`Sample ID`, data$`Patient ID`)
+
+
+# Check unique values in cancer type, Study ID, Sample Type, Number of Samples Per Patient
+unique_cancer_types <- unique(data$`Cancer Type`)
+unique_study_ids <- unique(data$`Study ID`)
+unique_sample_types <- unique(data$`Sample Type`)
+unique_numbers_of_samples_per_patient<-unique(data$`Number of Samples Per Patient`)
+
+
+# If assumptions are true, remove redundant columns
+if (identical_ids) {
+  data <- subset(data, select = -`Sample ID`)
+}
+
+if (length(unique_cancer_types) == 1) {
+  data <- subset(data, select = -`Cancer Type`)
+}
+
+if (length(unique_study_ids) == 1) {
+  data <- subset(data, select = -`Study ID`)
+}
+
+if (length(unique_sample_types) == 1) {
+  data <- subset(data, select = -`Sample Type`)
+}
+
+if (length(unique_numbers_of_samples_per_patient) == 1) {
+  data <- subset(data, select = -`Number of Samples Per Patient`)
+}
+
+# suppressing the sex variable
+data <- subset(data, select = -`Sex`)
+
+# suppressing the ER status
+data <- subset(data, select = -`ER Status`)
+
+```
+
+```{r}
+df <- as.data.frame(data)
+```
+
+
+### data overview
+
+```{r}
+cat("Dataset dimensions:", nrow(df), "rows x", ncol(df), "columns\n\n")
+
+# Missing values summary
+missing_summary <- data.frame(
+  Variable = names(df),
+  Missing_Count = colSums(is.na(df)),
+  Missing_Percent = round(colSums(is.na(df)) / nrow(df) * 100, 2)
+) %>% filter(Missing_Count > 0)
+
+print(missing_summary)
+```
+
+### DEFINE VARIABLE TYPES
+
+```{r}
+continuous_vars <- c(
+  "Age at Diagnosis", "Lymph nodes examined positive", "Mutation Count",
+  "Nottingham prognostic index", "Overall Survival (Months)",
+  "Relapse Free Status (Months)", "TMB (nonsynonymous)", "Tumor Size"
+)
+
+categorical_vars <- c(
+  "Type of Breast Surgery", "Chemotherapy", "ER status measured by IHC",
+  "HER2 Status", "Hormone Therapy", "Inferred Menopausal State",
+  "PR Status", "Radio Therapy", "Tumor Stage"
+)
+```
+
+### UNIVARIATE ANALYSIS
+
+```{r}
+# Continuous variables: histograms + boxplots
+for (var in continuous_vars) {
+  if (var %in% names(df)) {
+    # Histogram with density
+    p1 <- ggplot(df, aes(x = .data[[var]])) +
+      geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+      geom_density(aes(y = after_stat(count)), color = "red", linewidth = 1) +
+      theme_minimal() +
+      labs(title = paste("Distribution:", var))
+    
+    # Boxplot
+    p2 <- ggplot(df, aes(y = .data[[var]])) +
+      geom_boxplot(fill = "lightblue", outlier.color = "red") +
+      theme_minimal() +
+      labs(title = paste("Boxplot:", var))
+    
+    print(grid.arrange(p1, p2, ncol = 2))
+  }
+}
+
+# Categorical variables: bar charts
+for (var in categorical_vars) {
+  if (var %in% names(df)) {
+    p <- ggplot(df, aes(x = .data[[var]])) +
+      geom_bar(fill = "coral") +
+      geom_text(stat = 'count', aes(label = after_stat(count)), vjust = -0.5) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = paste("Distribution:", var))
+    print(p)
+  }
+}
+```
+
+### BIVARIATE ANALYSIS
+
+```{r}
+# Function to create boxplots for continuous vs categorical
+plot_bivariate <- function(cat_var, cont_var, data) {
+  if (cat_var %in% names(data) & cont_var %in% names(data)) {
+    ggplot(data, aes(x = .data[[cat_var]], y = .data[[cont_var]])) +
+      geom_boxplot(fill = "lightgreen", alpha = 0.6) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = paste(cont_var, "by", cat_var))
+  }
+}
+
+# Key bivariate relationships
+key_pairs <- list(
+  c("Type of Breast Surgery", "Tumor Size"),
+  c("ER status measured by IHC", "Overall Survival (Months)"),
+  c("Chemotherapy", "Overall Survival (Months)"),
+  c("Tumor Stage", "Age at Diagnosis")
+)
+
+for (pair in key_pairs) {
+  p <- plot_bivariate(pair[1], pair[2], df)
+  if (!is.null(p)) print(p)
+}
+```
+
+### CORRELATION ANALYSIS
+
+```{r}
+#Select numeric variables and create dummies for categorical
+numeric_vars <- c("Age at Diagnosis", "Neoplasm Histologic Grade",
+                  "Lymph nodes examined positive", "Mutation Count",
+                  "Nottingham prognostic index", "Overall Survival (Months)",
+                  "Tumor Size", "Tumor Stage")
+
+# Prepare data with complete cases
+df_corr <- df %>%
+  select(all_of(c(numeric_vars, categorical_vars))) %>%
+  filter(complete.cases(.))
+
+# Create dummy variables
+df_dummies <- df_corr
+for (var in categorical_vars) {
+  if (var %in% names(df_dummies)) {
+    formula_str <- as.formula(paste0("~ `", var, "` - 1"))
+    dummies <- model.matrix(formula_str, data = df_dummies)
+    colnames(dummies) <- gsub("`", "", colnames(dummies))
+    colnames(dummies) <- gsub(var, paste0(var, "_"), colnames(dummies), fixed = TRUE)
+    df_dummies <- cbind(df_dummies, dummies)
+    df_dummies[[var]] <- NULL
+  }
+}
+
+# Correlation matrix
+cor_matrix <- cor(df_dummies, use = "complete.obs")
+
+# Plot full correlation matrix
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.cex = 0.5, tl.col = "black",
+         title = "Correlation Matrix - All Variables",
+         mar = c(0, 0, 2, 0))
+
+# Focus on continuous variables
+continuous_in_data <- intersect(numeric_vars, names(df_dummies))
+cor_matrix_cont <- cor(df_dummies[, continuous_in_data])
+
+corrplot(cor_matrix_cont, method = "circle", type = "upper",
+         addCoef.col = "black", number.cex = 0.7,
+         tl.col = "black", tl.srt = 45,
+         title = "Correlation Matrix - Continuous Variables",
+         mar = c(0, 0, 2, 0))
+
+# Pairwise scatterplots for key variables
+key_vars <- c("Age at Diagnosis", "Tumor Size", "Overall Survival (Months)",
+              "Nottingham prognostic index")
+key_vars <- intersect(key_vars, names(df))
+
+if (length(key_vars) > 1) {
+  ggpairs(df[, key_vars], title = "Pairwise Relationships")
+}
+```
+
+### KAPLAN-MEIER SURVIVAL CURVES
+
+```{r}
+# Prepare survival data
+df_surv <- df %>%
+  mutate(
+    os_event = ifelse(grepl("1:|DECEASED|Died", `Overall Survival Status`), 1, 0),
+    rfs_event = ifelse(grepl("1:|Recurred", `Relapse Free Status`), 1, 0)
+  )
+
+# Function to create and plot KM curves
+plot_km <- function(time_var, event_var, group_var, data, title_prefix = "Survival") {
+  df_temp <- data %>%
+    filter(!is.na(.data[[group_var]]), !is.na(.data[[time_var]]), !is.na(.data[[event_var]]))
+  
+  if (nrow(df_temp) < 10) return(NULL)
+  
+  # Create a simple dataframe with renamed columns for survfit
+  surv_data <- data.frame(
+    time = df_temp[[time_var]],
+    event = df_temp[[event_var]],
+    group = factor(df_temp[[group_var]])
+  )
+  
+  # Fit KM model
+  km_fit <- survfit(Surv(time, event) ~ group, data = surv_data)
+  
+  ggsurvplot(
+    km_fit, data = surv_data,
+    title = paste(title_prefix, "by", group_var),
+    pval = TRUE, conf.int = TRUE,
+    risk.table = TRUE, risk.table.height = 0.25,
+    legend.title = group_var,
+    legend.labs = levels(surv_data$group),
+    palette = "jco",
+    ggtheme = theme_minimal()
+  )
+}
+
+# Overall Survival curves for all categorical variables
+cat("\n=== Overall Survival Curves ===\n")
+for (var in categorical_vars) {
+  if (var %in% names(df_surv)) {
+    p <- plot_km("Overall Survival (Months)", "os_event", var, df_surv, "Overall Survival")
+    if (!is.null(p)) print(p)
+  }
+}
+
+# Relapse-Free Survival curves for key variables
+cat("\n=== Relapse-Free Survival Curves ===\n")
+key_rfs_vars <- c("Chemotherapy", "ER status measured by IHC", "HER2 Status", "Tumor Stage", "Cellularity")
+for (var in key_rfs_vars) {
+  if (var %in% names(df_surv)) {
+    p <- plot_km("Relapse Free Status (Months)", "rfs_event", var, df_surv, "Relapse-Free Survival")
+    if (!is.null(p)) print(p)
+  }
+}
+```
+```{r}
+# Prepare survival data
+df_surv <- df %>%
+  mutate(
+    os_event = ifelse(grepl("1:|DECEASED|Died", `Overall Survival Status`), 1, 0),
+    rfs_event = ifelse(grepl("1:|Recurred", `Relapse Free Status`), 1, 0)
+  )
+
+# Function to create and plot KM curves
+plot_km <- function(time_var, event_var, group_var, data, title_prefix = "Survival") {
+  df_temp <- data %>%
+    filter(!is.na(.data[[group_var]]), !is.na(.data[[time_var]]), !is.na(.data[[event_var]]))
+  
+  if (nrow(df_temp) < 10) return(NULL)
+  
+  # Create a simple dataframe with renamed columns for survfit
+  surv_data <- data.frame(
+    time = df_temp[[time_var]],
+    event = df_temp[[event_var]],
+    group = factor(df_temp[[group_var]])
+  )
+  
+  # Fit KM model
+  km_fit <- survfit(Surv(time, event) ~ group, data = surv_data)
+  
+  ggsurvplot(
+    km_fit, data = surv_data,
+    title = paste(title_prefix, "by", group_var),
+    pval = TRUE, conf.int = TRUE,
+    risk.table = TRUE, risk.table.height = 0.25,
+    legend.title = group_var,
+    legend.labs = levels(surv_data$group),
+    palette = "jco",
+    ggtheme = theme_minimal()
+  )
+}
+
+# Function to perform log-rank test and return results
+perform_logrank_test <- function(time_var, event_var, group_var, data) {
+  df_temp <- data %>%
+    filter(!is.na(.data[[group_var]]), !is.na(.data[[time_var]]), !is.na(.data[[event_var]]))
+  
+  if (nrow(df_temp) < 10 || length(unique(df_temp[[group_var]])) < 2) {
+    return(data.frame(
+      Variable = group_var,
+      N = nrow(df_temp),
+      N_Groups = length(unique(df_temp[[group_var]])),
+      Chi_Square = NA,
+      DF = NA,
+      P_Value = NA,
+      Significance = "Not enough data"
+    ))
+  }
+  
+  # Create survival object
+  surv_data <- data.frame(
+    time = df_temp[[time_var]],
+    event = df_temp[[event_var]],
+    group = factor(df_temp[[group_var]])
+  )
+  
+  # Perform log-rank test
+  logrank_test <- survdiff(Surv(time, event) ~ group, data = surv_data)
+  
+  # Extract p-value
+  p_value <- 1 - pchisq(logrank_test$chisq, length(logrank_test$n) - 1)
+  
+  # Determine significance
+  sig_level <- ifelse(p_value < 0.001, "***",
+                      ifelse(p_value < 0.01, "**",
+                             ifelse(p_value < 0.05, "*", "NS")))
+  
+  return(data.frame(
+    Variable = group_var,
+    N = nrow(df_temp),
+    N_Groups = length(unique(df_temp[[group_var]])),
+    Chi_Square = round(logrank_test$chisq, 3),
+    DF = length(logrank_test$n) - 1,
+    P_Value = formatC(p_value, format = "e", digits = 3),
+    Significance = sig_level
+  ))
+}
+
+# Overall Survival: Test results summary
+cat("\n", rep("=", 80), "\n")
+cat("OVERALL SURVIVAL - LOG-RANK TEST RESULTS\n")
+cat(rep("=", 80), "\n")
+
+os_test_results <- data.frame()
+for (var in categorical_vars) {
+  if (var %in% names(df_surv)) {
+    test_result <- perform_logrank_test("Overall Survival (Months)", "os_event", var, df_surv)
+    os_test_results <- rbind(os_test_results, test_result)
+  }
+}
+
+print(os_test_results, row.names = FALSE)
+cat("\nSignificance codes: *** p<0.001, ** p<0.01, * p<0.05, NS = not significant\n\n")
+
+# Overall Survival curves for significant variables
+cat("\n=== Overall Survival Curves (All Variables) ===\n")
+for (var in categorical_vars) {
+  if (var %in% names(df_surv)) {
+    p <- plot_km("Overall Survival (Months)", "os_event", var, df_surv, "Overall Survival")
+    if (!is.null(p)) print(p)
+  }
+}
+
+# Relapse-Free Survival: Test results summary
+cat("\n", rep("=", 80), "\n")
+cat("RELAPSE-FREE SURVIVAL - LOG-RANK TEST RESULTS\n")
+cat(rep("=", 80), "\n")
+
+rfs_test_results <- data.frame()
+for (var in categorical_vars) {
+  if (var %in% names(df_surv)) {
+    test_result <- perform_logrank_test("Relapse Free Status (Months)", "rfs_event", var, df_surv)
+    rfs_test_results <- rbind(rfs_test_results, test_result)
+  }
+}
+
+print(rfs_test_results, row.names = FALSE)
+cat("\nSignificance codes: *** p<0.001, ** p<0.01, * p<0.05, NS = not significant\n\n")
+
+# Relapse-Free Survival curves for significant variables
+cat("\n=== Relapse-Free Survival Curves (Key Variables) ===\n")
+key_rfs_vars <- c("Chemotherapy", "ER status measured by IHC", "HER2 Status", "Tumor Stage")
+for (var in key_rfs_vars) {
+  if (var %in% names(df_surv)) {
+    p <- plot_km("Relapse Free Status (Months)", "rfs_event", var, df_surv, "Relapse-Free Survival")
+    if (!is.null(p)) print(p)
+  }
+}
+
+# Create comparison table of significant variables
+cat("\n", rep("=", 80), "\n")
+cat("SUMMARY: VARIABLES WITH SIGNIFICANT SURVIVAL DIFFERENCES\n")
+cat(rep("=", 80), "\n")
+
+significant_os <- os_test_results %>%
+  filter(Significance != "NS" & Significance != "Not enough data") %>%
+  arrange(Chi_Square) %>%
+  select(Variable, P_Value, Significance)
+
+significant_rfs <- rfs_test_results %>%
+  filter(Significance != "NS" & Significance != "Not enough data") %>%
+  arrange(Chi_Square) %>%
+  select(Variable, P_Value, Significance)
+
+cat("\nSignificant for Overall Survival:\n")
+if (nrow(significant_os) > 0) {
+  print(significant_os, row.names = FALSE)
+} else {
+  cat("No significant variables found.\n")
+}
+
+cat("\nSignificant for Relapse-Free Survival:\n")
+if (nrow(significant_rfs) > 0) {
+  print(significant_rfs, row.names = FALSE)
+} else {
+  cat("No significant variables found.\n")
+}
+```

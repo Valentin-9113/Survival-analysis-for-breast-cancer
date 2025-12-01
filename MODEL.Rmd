@@ -1,0 +1,662 @@
+---
+title: "modelcode"
+author: "Valentin CAPIEU"
+date: "2025-11-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(caret)
+library(dplyr)
+```
+
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(corrplot)
+library(GGally)
+library(gridExtra)
+library(reshape2)
+library(data.table)
+#install.packages("survival")
+library(survival)
+#install.packages("survminer")
+library(survminer)
+library(mice)
+library(caret)
+library(ggplot2)
+library(rms)
+library(riskRegression)
+library(pec)
+library(randomForestSRC)
+
+```
+```{r}
+#install.packages("devtools")
+# library(devtools)
+# 
+# install_version("rms", version = "6.7-1")     # or another matching version
+
+```
+
+
+### pre processing
+
+```{r}
+# Load dataset
+data <- fread("data/brca_metabric_clinical_data.tsv")
+```
+
+```{r}
+# Check if Sample ID and Patient ID are identical
+identical_ids <- identical(data$`Sample ID`, data$`Patient ID`)
+cat("Are 'Sample ID' and 'Patient ID' identical? →", identical_ids, "\n")
+
+# Check unique values in cancer type, Study ID, Sample Type, Number of Samples Per Patient
+unique_cancer_types <- unique(data$`Cancer Type`)
+unique_study_ids <- unique(data$`Study ID`)
+unique_sample_types <- unique(data$`Sample Type`)
+unique_numbers_of_samples_per_patient<-unique(data$`Number of Samples Per Patient`)
+
+#cat("Unique values in 'Cancer Type':", length(unique_cancer_types), "\n")
+#cat("Unique values in 'Study ID':", length(unique_study_ids), "\n")
+cat("Unique values in 'Study ID','Cancer Type','Sample Type','Number of Samples Per Patient' : ", length(unique_cancer_types), length(unique_study_ids), length(unique_sample_types), length(unique_numbers_of_samples_per_patient), "\n")
+
+# If assumptions are true, remove redundant columns
+if (identical_ids) {
+  data <- subset(data, select = -`Sample ID`)
+}
+
+
+if (length(unique_cancer_types) == 1) {
+  data <- subset(data, select = -`Cancer Type`)
+}
+
+if (length(unique_study_ids) == 1) {
+  data <- subset(data, select = -`Study ID`)
+}
+
+if (length(unique_sample_types) == 1) {
+  data <- subset(data, select = -`Sample Type`)
+}
+
+if (length(unique_numbers_of_samples_per_patient) == 1) {
+  data <- subset(data, select = -`Number of Samples Per Patient`)
+}
+#supressing id variables
+data <- subset(data, select = -`Patient ID`)
+
+# suppressing the sex variable
+data <- subset(data, select = -`Sex`)
+
+# suppressing the ER status
+data <- subset(data, select = -`ER Status`)
+
+# Due to the correlation, I think it is fair to remove Neoplasm Histologic Grade and mutation count, because they are respectivly highly correlated to notthingham prognostic index and TMB.
+data <- subset(data, select = -`Neoplasm Histologic Grade`)
+data <- subset(data, select = -`Mutation Count`)
+data <- subset(data, select = -`Cohort`)
+
+# because of NA issue in the cox model, these variable will be removed
+data <- subset(data, select = -`Oncotree Code`)
+data <- subset(data, select = -`Tumor Other Histologic Subtype`)
+
+df <- data
+# Confirm structure after cleaning
+cat("\nColumns remaining after cleaning:\n")
+print(names(data))
+```
+
+### HANDLING MISSING VALUES
+
+```{r}
+# Check missing data pattern
+cat("Missing data summary:\n")
+print(colSums(is.na(data)))
+cat("\n")
+
+# Prepare data for imputation
+# Convert character variables to factors for mice
+char_cols <- names(data)[sapply(data, is.character)]
+for(col in char_cols) {
+  data[[col]] <- as.factor(data[[col]])
+}
+```
+
+```{r}
+cat("Starting multiple imputation with mice...\n")
+# Perform imputation (m=5 imputations, maxit=5 iterations)
+imp <- mice(data, m = 5, maxit = 5, method = 'pmm', seed = 123, printFlag = FALSE)
+
+cat("Imputation completed.\n")
+# Use the first imputed dataset (you could also pool results across all m)
+data_imputed <- complete(imp, 1)
+
+# Verify no missing values
+cat("\nMissing values after imputation:\n")
+print(sum(is.na(data_imputed)))
+```
+
+
+### CHOOSE OUTCOME AND PREPARE SURVIVAL VARIABLES
+
+```{r}
+# Option 1: Relapse Free Status (RFS)
+# Option 2: Overall Survival (OS)
+
+# Let's prepare both and you can choose which to use
+# For RFS:
+data_imputed$rfs_time <- data_imputed$`Relapse Free Status (Months)`
+data_imputed$rfs_event <- ifelse(data_imputed$`Relapse Free Status` == "1:Recurred", 1, 0)
+
+# For OS:
+data_imputed$os_time <- data_imputed$`Overall Survival (Months)`
+data_imputed$os_event <- ifelse(data_imputed$`Overall Survival Status` == "1:DECEASED", 1, 0)
+
+# CHOOSE YOUR OUTCOME HERE:
+# Set outcome = "rfs" for Relapse Free Status or "os" for Overall Survival
+outcome <- "rfs"  # Change this to "os" for Overall Survival
+
+if(outcome == "rfs") {
+  data_imputed$time <- data_imputed$rfs_time
+  data_imputed$event <- data_imputed$rfs_event
+  cat("\nUsing Relapse Free Status as outcome\n")
+} else {
+  data_imputed$time <- data_imputed$os_time
+  data_imputed$event <- data_imputed$os_event
+  cat("\nUsing Overall Survival as outcome\n")
+}
+
+# Check event distribution
+cat("\nEvent distribution:\n")
+print(table(data_imputed$event))
+cat("Event rate:", mean(data_imputed$event), "\n")
+```
+
+### TRAIN-TEST SPLIT WITH STRATIFICATION
+
+```{r}
+set.seed(123)
+# Stratified split based on event status
+train_index <- createDataPartition(data_imputed$event, p = 0.75, list = FALSE)
+
+train_data <- data_imputed[train_index, ]
+test_data <- data_imputed[-train_index, ]
+
+# Verify stratification
+cat("\nTrain-Test Split Verification:\n")
+cat("Train size:", nrow(train_data), "\n")
+cat("Test size:", nrow(test_data), "\n")
+cat("Train event rate:", mean(train_data$event), "\n")
+cat("Test event rate:", mean(test_data$event), "\n")
+```
+### MODEL 1: STANDARD COX MODEL (LINEAR EFFECTS ONLY)
+
+```{r}
+# Select relevant predictors
+# Exclude outcome variables and redundant columns
+exclude_cols <- c("Relapse Free Status (Months)", "Relapse Free Status",
+                  "Overall Survival (Months)", "Overall Survival Status",
+                  "Patient's Vital Status", "time", "event", 
+                  "rfs_time", "rfs_event", "os_time", "os_event")
+
+predictor_cols <- setdiff(names(train_data), exclude_cols)
+
+# Create formula for Cox model
+# Wrap variable names with spaces in backticks
+predictor_cols_clean <- paste0("`", predictor_cols, "`")
+formula_cox1 <- as.formula(paste("Surv(time, event) ~", 
+                                  paste(predictor_cols_clean, collapse = " + ")))
+
+# Fit standard Cox model - remove NA coefficients
+cox_model1 <- coxph(formula_cox1, data = train_data, x = TRUE)
+
+# Check for NA coefficients and refit without problematic variables if needed
+if(any(is.na(coef(cox_model1)))) {
+  cat("\nWarning: Some coefficients are NA. Removing problematic variables...\n")
+  na_vars <- names(coef(cox_model1))[is.na(coef(cox_model1))]
+  cat("Variables with NA coefficients:", na_vars, "\n")
+  
+  # Identify base variable names (remove factor level suffixes)
+  na_base_vars <- unique(gsub("`.+", "`", na_vars))
+  predictor_cols_filtered <- setdiff(predictor_cols, gsub("`", "", na_base_vars))
+  
+  # Refit model
+  predictor_cols_clean <- paste0("`", predictor_cols_filtered, "`")
+  formula_cox1 <- as.formula(paste("Surv(time, event) ~", 
+                                    paste(predictor_cols_clean, collapse = " + ")))
+  cox_model1 <- coxph(formula_cox1, data = train_data, x = TRUE)
+  
+  # Update predictor_cols for Model 2
+  predictor_cols <- predictor_cols_filtered
+}
+
+cat("\nModel 1 Summary:\n")
+print(summary(cox_model1))
+
+# Model diagnostics
+cat("\nConcordance index (C-index) on train data:", 
+    summary(cox_model1)$concordance[1], "\n")
+
+# Test set performance
+# risk_score_test1 <- predict(cox_model1, newdata = test_data, type = "risk")
+cox_test1 <- coxph(Surv(time, event) ~ risk_score_test1, data = test_data)
+cat("C-index on test data:", summary(cox_test1)$concordance[1], "\n")
+```
+
+
+### MODEL 2: EXTENDED COX MODEL (NONLINEAR & COMPLEX RELATIONSHIPS)
+
+```{r}
+cat("\n=== MODEL 2: Extended Cox Model with P-splines ===\n")
+
+# Identify continuous and categorical variables
+continuous_vars <- c("Age at Diagnosis", "Lymph nodes examined positive",
+                     "Nottingham prognostic index", "TMB (nonsynonymous)",
+                     "Tumor Size")
+
+# Only keep continuous variables that exist in the data
+continuous_vars <- intersect(continuous_vars, names(train_data))
+
+# Create formula with pspline for continuous variables
+pspline_terms <- paste0("pspline(`", continuous_vars, "`)", collapse = " + ")
+categorical_vars <- setdiff(predictor_cols, continuous_vars)
+categorical_terms <- paste0("`", categorical_vars, "`", collapse = " + ")
+
+formula_cox2 <- as.formula(paste("Surv(time, event) ~", 
+                                  pspline_terms, "+", categorical_terms))
+
+# Fit extended Cox model with psplines
+cox_model2 <- coxph(formula_cox2, data = train_data, x = TRUE)
+
+cat("\nModel 2 Summary:\n")
+print(summary(cox_model2))
+
+# Model diagnostics
+cat("\nConcordance index (C-index) on train data:", 
+    summary(cox_model2)$concordance[1], "\n")
+
+# Test set performance
+# risk_score_test2 <- predict(cox_model2, newdata = test_data, type = "risk")
+cox_test2 <- coxph(Surv(time, event) ~ risk_score_test2, data = test_data)
+cat("C-index on test data:", summary(cox_test2)$concordance[1], "\n")
+```
+
+### MODEL COMPARISON
+
+```{r}
+# Compare models using AIC and likelihood ratio test
+cat("\nModel 1 AIC:", AIC(cox_model1), "\n")
+cat("Model 2 AIC:", AIC(cox_model2), "\n")
+
+# Likelihood ratio test
+lr_test <- anova(cox_model1, cox_model2)
+cat("\nLikelihood Ratio Test:\n")
+print(lr_test)
+```
+
+### VIZUALISATION
+
+```{r}
+# Kaplan-Meier curve for the entire dataset
+km_fit <- survfit(Surv(time, event) ~ 1, data = data_imputed)
+plot(km_fit, xlab = "Time (Months)", ylab = "Survival Probability",
+     main = "Kaplan-Meier Survival Curve")
+
+# Risk groups based on Model 2
+risk_groups <- cut(predict(cox_model2, type = "risk"), 
+                   breaks = quantile(predict(cox_model2, type = "risk"), 
+                                    probs = c(0, 0.33, 0.67, 1)),
+                   labels = c("Low", "Medium", "High"),
+                   include.lowest = TRUE)
+
+train_data$risk_group <- risk_groups
+km_fit_risk <- survfit(Surv(time, event) ~ risk_group, data = train_data)
+
+# Plot survival curves by risk group
+ggsurvplot(km_fit_risk, data = train_data,
+           pval = TRUE, conf.int = TRUE,
+           risk.table = TRUE,
+           title = "Survival by Risk Group (Model 2)",
+           xlab = "Time (Months)",
+           ylab = "Survival Probability",
+           legend.labs = c("Low Risk", "Medium Risk", "High Risk"))
+```
+### BRIER SCORE ANALYSIS
+
+```{r}
+# Calculate Brier scores using riskRegression
+# Define time points for evaluation (avoid extreme values)
+max_time_eval <- quantile(test_data$time, 0.9, na.rm = TRUE)
+time_points <- seq(1, max_time_eval, length.out = 40)
+
+# Calculate Brier scores for both models on test data
+tryCatch({
+  brier_model1 <- Score(list("Model 1" = cox_model1, "Model 2" = cox_model2),
+                        formula = Surv(time, event) ~ 1,
+                        data = test_data,
+                        times = time_points,
+                        metrics = "brier",
+                        summary = "ipa",
+                        se.fit = FALSE)
+  
+  cat("\nBrier Score Summary:\n")
+  print(brier_model1)
+  
+  # Plot Brier scores as a function of time
+  plotBrier <- plotBrier(brier_model1, 
+                         main = "Brier Score over Time",
+                         xlab = "Time (Months)",
+                         ylab = "Brier Score")
+  print(plotBrier)
+}, error = function(e) {
+  cat("\nError in riskRegression Score calculation:", e$message, "\n")
+  cat("Continuing with custom IBS calculation...\n")
+})
+```
+
+### INTEGRATED BRIER SCORE FUNCTION
+
+```{r}
+# Function to calculate Integrated Brier Score (IBS)
+# Based on: https://square.github.io/pysurvival/metrics/brier_score.html
+calculate_ibs <- function(model, newdata, time_col = "time", event_col = "event", 
+                         max_time = NULL) {
+  
+  # Extract time and event from newdata
+  time_obs <- newdata[[time_col]]
+  event_obs <- newdata[[event_col]]
+  
+  # Set max_time if not provided
+  if(is.null(max_time)) {
+    max_time <- max(time_obs, na.rm = TRUE)
+  }
+  
+  # Create time grid for integration
+  time_grid <- seq(0, max_time, length.out = 100)
+  
+  # Get survival predictions for each time point
+  surv_pred <- predictSurvProb(model, newdata = newdata, times = time_grid)
+  
+  # Calculate Brier score at each time point
+  brier_scores <- numeric(length(time_grid))
+  
+  for(i in 1:length(time_grid)) {
+    t <- time_grid[i]
+    
+    # Predicted survival probability at time t
+    S_pred <- surv_pred[, i]
+    
+    # Observed status at time t
+    # Y(t) = 1 if event occurred before or at t, 0 otherwise
+    Y_t <- ifelse(time_obs <= t & event_obs == 1, 1, 0)
+    
+    # For censored observations before t, we need to weight appropriately
+    # Using Inverse Probability of Censoring Weighting (IPCW)
+    
+    # Fit censoring distribution (reverse Kaplan-Meier)
+    cens_km <- survfit(Surv(time_obs, 1 - event_obs) ~ 1)
+    
+    # Get censoring weights at time t
+    weights <- numeric(length(time_obs))
+    for(j in 1:length(time_obs)) {
+      if(time_obs[j] > t) {
+        # Subject still at risk at time t
+        weights[j] <- 1 / summary(cens_km, times = t)$surv
+      } else if(event_obs[j] == 1) {
+        # Event occurred before or at t
+        weights[j] <- 1 / summary(cens_km, times = time_obs[j])$surv
+      } else {
+        # Censored before t
+        weights[j] <- 0
+      }
+    }
+    
+    # Calculate weighted Brier score
+    brier_scores[i] <- mean(weights * (Y_t - S_pred)^2, na.rm = TRUE)
+  }
+  
+  # Integrate using trapezoidal rule
+  ibs <- sum(diff(time_grid) * (brier_scores[-1] + brier_scores[-length(brier_scores)])) / 2 / max_time
+  
+  return(list(
+    ibs = ibs,
+    time_grid = time_grid,
+    brier_scores = brier_scores
+  ))
+}
+
+# Calculate IBS for both models on test data
+cat("\nCalculating Integrated Brier Score on test data...\n")
+
+ibs_model1 <- calculate_ibs(cox_model1, test_data)
+ibs_model2 <- calculate_ibs(cox_model2, test_data)
+
+cat("\nIntegrated Brier Score (IBS):\n")
+cat("Model 1 (Linear):", round(ibs_model1$ibs, 4), "\n")
+cat("Model 2 (P-splines):", round(ibs_model2$ibs, 4), "\n")
+
+# Plot comparison of Brier scores over time
+plot_data <- data.frame(
+  Time = c(ibs_model1$time_grid, ibs_model2$time_grid),
+  Brier_Score = c(ibs_model1$brier_scores, ibs_model2$brier_scores),
+  Model = rep(c("Model 1 (Linear)", "Model 2 (P-splines)"), 
+              each = length(ibs_model1$time_grid))
+)
+
+ggplot(plot_data, aes(x = Time, y = Brier_Score, color = Model)) +
+  geom_line(size = 1) +
+  labs(title = "Brier Score over Time - Test Set",
+       x = "Time (Months)",
+       y = "Brier Score") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+### 
+
+```{r}
+
+#create profile
+profiles <- data.frame(
+
+  # Numeric
+  `Age at Diagnosis` = c(50, 60, 75),
+  `Nottingham prognostic index` = c(4.5, 5.2, 6.1),
+  `TMB (nonsynonymous)` = c(1.2, 2.5, 4.0),
+  `Tumor Size` = c(15, 28, 45),
+  `Lymph nodes examined positive` = c(0, 3, 10),
+  `Tumor Stage` = c(1, 2, 3),
+
+  # Factors — ALL factor levels taken from your dataset
+  `Type of Breast Surgery` = factor(
+    c("BREAST CONSERVING", "BREAST CONSERVING", "MASTECTOMY"),
+    levels = levels(train_data$`Type of Breast Surgery`)
+  ),
+
+  `Cancer Type Detailed` = factor(
+    c("Breast Invasive Ductal Carcinoma",
+      "Breast Invasive Lobular Carcinoma",
+      "Breast"),
+    levels = levels(train_data$`Cancer Type Detailed`)
+  ),
+
+  Cellularity = factor(
+    c("High", "Moderate", "Low"),
+    levels = levels(train_data$Cellularity)
+  ),
+
+  Chemotherapy = factor(
+    c("NO", "YES", "YES"),
+    levels = levels(train_data$`Chemotherapy`)
+  ),
+
+  `Pam50 + Claudin-low subtype` = factor(
+    c("LumA", "Basal", "LumB"),
+    levels = levels(train_data$`Pam50 + Claudin-low subtype`)
+  ),
+
+  `ER status measured by IHC` = factor(
+    c("Positve", "Positve", "Negative"),
+    levels = levels(train_data$`ER status measured by IHC`)
+  ),
+
+  `HER2 status measured by SNP6` = factor(
+    c("NEUTRAL", "GAIN", "LOSS"),
+    levels = levels(train_data$`HER2 status measured by SNP6`)
+  ),
+
+  `HER2 Status` = factor(
+    c("Negative", "Negative", "Positive"),
+    levels = levels(train_data$`HER2 Status`)
+  ),
+
+  `Hormone Therapy` = factor(
+    c("YES", "NO", "YES"),
+    levels = levels(train_data$`Hormone Therapy`)
+  ),
+
+  `Inferred Menopausal State` = factor(
+    c("Post", "Pre", "Post"),
+    levels = levels(train_data$`Inferred Menopausal State`)
+  ),
+
+  `Integrative Cluster` = factor(
+    c("3", "10", "1"),
+    levels = levels(train_data$`Integrative Cluster`)
+  ),
+
+  `Primary Tumor Laterality` = factor(
+    c("Left", "Right", "Left"),
+    levels = levels(train_data$`Primary Tumor Laterality`)
+  ),
+
+  `PR Status` = factor(
+    c("Negative", "Positive", "Positive"),
+    levels = levels(train_data$`PR Status`)
+  ),
+
+  `Radio Therapy` = factor(
+    c("YES", "NO", "YES"),
+    levels = levels(train_data$`Radio Therapy`)
+  ),
+
+  `3-Gene classifier subtype` = factor(
+    c("ER+/HER2- High Prolif", "ER-/HER2-", "ER+/HER2- Low Prolif"),
+    levels = levels(train_data$`3-Gene classifier subtype`)
+  ),
+
+  check.names = FALSE
+)
+
+# Predicted survival curves for these two profiles
+surv_pred <- survfit(cox_model1, newdata = profiles)
+```
+
+```{r}
+# Basic plot
+plot(surv_profiles, 
+     col = c("blue", "red", "darkgreen"),
+     lwd = 2,
+     lty = 1,
+     xlab = "Time",
+     ylab = "Survival Probability",
+     main = "Predicted Survival Curves for 3 Profiles")
+
+# Add legend
+legend("bottomleft",
+       legend = c("Profile 1", "Profile 2", "Profile 3"),
+       col = c("blue", "red", "darkgreen"),
+       lwd = 2,
+       lty = 1,
+       bty = "n")
+```
+
+```{r}
+sf <- survfit(cox_model1, newdata = profiles[1, ])   # I choose profile 1
+
+S_7  <- summary(sf, times = 84)$surv
+S_12 <- summary(sf, times = 144)$surv
+conditional_prob <- S_12 / S_7
+```
+
+### RANDOM FOREST (failed...)
+
+```{r}
+
+
+train_data_clean <- paste0("`", train_data, "`")
+formula_cox1 <- as.formula(
+  paste("Surv(time, event) ~", paste(predictor_cols_clean, collapse = " + "))
+)
+
+cox_model1 <- coxph(formula_cox1, data = train_data, x = TRUE)
+
+valid_predictors <- predictor_cols_clean[predictor_cols_clean %in% names(train_data_clean)]
+
+train_data_rsf <- train_data[, c("time", "event", valid_predictors)]
+
+formula_rsf <- as.formula(
+  paste("Surv(time, event) ~", paste(predictor_cols_clean, collapse = " + "))
+)
+
+rsf_default <- rfsrc(
+  formula = formula_rsf,
+  data = train_data,
+  ntree = 1000,
+  importance = TRUE
+)
+
+
+tune_result <- tune(
+  formula_rsf,
+  data = train_data,
+  ntreeTry = 500,
+  mtryStart = 2,
+  nodesizeTry = c(5, 10, 20),
+  stepFactor = 1.5,
+  trace = TRUE
+)
+
+best_mtry     <- tune_result$optimal["mtry"]
+best_nodesize <- tune_result$optimal["nodesize"]
+
+rsf_tuned <- rfsrc(
+  formula = formula_rsf,
+  data = train_data,
+  ntree = 1500,
+  mtry = best_mtry,
+  nodesize = best_nodesize,
+  splitrule = "logrank",
+  importance = TRUE
+)
+
+
+times_eval <- seq(12, 144, by = 12)  
+
+bs_compare <- Score(
+  list(
+    Cox = cox_model1,
+    RSF.default = rsf_default,
+    RSF.tuned   = rsf_tuned
+  ),
+  formula = Surv(time, event) ~ 1,
+  data = test_data,
+  times = times_eval,
+  metrics = c("Brier")
+)
+
+print(cox_model1)
+print(rsf_default)
+print(rsf_tuned)
+print(tune_result)
+
+plot(bs_compare, models = c("Cox", "RSF.default", "RSF.tuned"),
+     main = "Brier Score Comparison: Cox vs RSF Models")
+
+```
+
